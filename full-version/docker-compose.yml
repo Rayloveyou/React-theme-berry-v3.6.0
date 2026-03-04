@@ -1,0 +1,52 @@
+version: "3.8"
+
+services:
+  berry-app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_VERSION: ${REACT_APP_VERSION}
+        REACT_APP_API_URL: ${REACT_APP_API_URL}
+        REACT_APP_FIREBASE_API_KEY: ${REACT_APP_FIREBASE_API_KEY}
+        REACT_APP_FIREBASE_AUTH_DOMAIN: ${REACT_APP_FIREBASE_AUTH_DOMAIN}
+        REACT_APP_FIREBASE_PROJECT_ID: ${REACT_APP_FIREBASE_PROJECT_ID}
+        REACT_APP_FIREBASE_STORAGE_BUCKET: ${REACT_APP_FIREBASE_STORAGE_BUCKET}
+        REACT_APP_FIREBASE_MESSAGING_SENDER_ID: ${REACT_APP_FIREBASE_MESSAGING_SENDER_ID}
+        REACT_APP_FIREBASE_APP_ID: ${REACT_APP_FIREBASE_APP_ID}
+        REACT_APP_FIREBASE_MEASUREMENT_ID: ${REACT_APP_FIREBASE_MEASUREMENT_ID}
+        REACT_APP_AWS_POOL_ID: ${REACT_APP_AWS_POOL_ID}
+        REACT_APP_AWS_APP_CLIENT_ID: ${REACT_APP_AWS_APP_CLIENT_ID}
+        REACT_APP_AUTH0_CLIENT_ID: ${REACT_APP_AUTH0_CLIENT_ID}
+        REACT_APP_AUTH0_DOMAIN: ${REACT_APP_AUTH0_DOMAIN}
+    container_name: berry-react-app
+    ports:
+      - "3000:8080"
+    restart: unless-stopped
+    read_only: true
+    tmpfs:
+      - /tmp/nginx:size=10M,uid=101,gid=101
+      - /var/cache/nginx:size=50M,uid=101,gid=101
+      - /var/run:size=1M,uid=101,gid=101
+    security_opt:
+      - no-new-privileges:true
+    # Resource limits for production
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.5"
+        reservations:
+          memory: 32M
+          cpus: "0.1"
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

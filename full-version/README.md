@@ -1,12 +1,314 @@
-# Introduction
+# Berry React Admin — Production Docker + Nginx
 
-This is material design template created based on materially structure
+Tài liệu này giải thích toàn bộ quyết định kỹ thuật khi đóng gói và triển khai ứng dụng React (TypeScript) dưới dạng container production-grade.
 
-# Getting Started
+---
 
-1. Installation process
-    - run 'npm install / yarn'
-    - start dev server run 'npm run start / yarn start'
-2. Deployment process
-    - Goto full-version directory and open package.json. Update homepage URL to the production URL
-    - Goto full-version directory and run 'npm run build / yarn build'
+## 1. Multi-stage Build & Layer Cache
+
+**Vấn đề:** Mỗi lần sửa code mà phải cài lại `node_modules` → tốn 2–3 phút.
+
+**Giải pháp:** Tách thành 3 stage:
+
+```
+Stage 1 — deps     : COPY package.json → npm ci
+Stage 2 — builder  : COPY node_modules (từ deps) → COPY source → npm run build
+Stage 3 — runtime  : COPY /app/build → nginx (không có Node, npm, source code)
+```
+
+**Tại sao hiệu quả:**
+- Docker cache layer theo thứ tự. `package.json` ít thay đổi → layer `npm ci` được cache.
+- Chỉ khi `package.json` đổi mới trigger reinstall.
+- Sửa source code chỉ invalidate từ `COPY . .` trở xuống.
+
+**Kích thước image:** Runtime chỉ chứa nginx + static files → < 40MB.
+
+---
+
+## 2. Non-root Container
+
+**Vấn đề:** Chạy nginx với root → nếu bị exploit, attacker có full quyền trong container.
+
+**Giải pháp:**
+- Dockerfile: `USER nginx` (uid=101, nginx:alpine có sẵn user này)
+- nginx.conf: không có `user` directive (nginx tự chạy theo process user)
+- Tất cả thư mục cần write được `chown nginx:nginx` trong Dockerfile
+- tmpfs trong docker-compose thêm `uid=101,gid=101` để mount đúng owner ngay từ đầu
+
+**Lý do phải thêm uid vào tmpfs:** Docker mount tmpfs sau khi image build xong → ghi đè `chown` đã làm trong Dockerfile. Phải chỉ định uid/gid ở mount options.
+
+```yaml
+tmpfs:
+  - /tmp/nginx:size=10M,uid=101,gid=101
+```
+
+---
+
+## 3. Healthcheck
+
+**Endpoint:** `GET /health` → trả về `200 OK` (text/plain).
+
+**Tại sao không dùng `index.html`:**
+- `index.html` là business logic (SPA entry point), có thể bị cache, redirect, hoặc trả 304.
+- Health endpoint phải luôn trả 200 nhanh, không phụ thuộc app state.
+- Load balancer/orchestrator (Docker, K8s) cần signal rõ ràng: alive hay dead.
+
+**Cấu hình:**
+```nginx
+location = /health {
+    access_log off;           # không pollute logs
+    add_header Cache-Control "no-cache, no-store";
+    return 200 "OK\n";
+}
+```
+
+```dockerfile
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+    CMD wget -q --spider http://localhost:8080/health || exit 1
+```
+
+---
+
+## 4. Cache Strategy
+
+### 4A. Hashed Static Assets (`/static/`)
+
+Ví dụ: `/static/js/main.3f1a9c.js`
+
+```nginx
+location ^~ /static/ {
+    expires 1y;
+    add_header Cache-Control "public, max-age=31536000, immutable";
+    etag off;
+}
+```
+
+**Tại sao cache 1 năm + immutable:**
+- CRA tạo hash từ nội dung file. Hash thay đổi → tên file thay đổi → URL mới hoàn toàn.
+- URL cũ không bao giờ có nội dung khác → browser không cần revalidate.
+- `immutable` nói thẳng với browser: "đừng bao giờ hỏi lại file này".
+- Tắt ETag vì tên file đã đóng vai trò versioning.
+
+### 4B. Non-hashed Assets (favicon, manifest, logo)
+
+```nginx
+location ~* ^/(favicon\.(ico|svg)|manifest\.json|logo.*)$ {
+    expires 5m;
+    add_header Cache-Control "public, max-age=300, must-revalidate";
+    etag on;
+}
+```
+
+Cache 5 phút + revalidation. Không có hash trong tên → phải cho phép browser kiểm tra lại.
+
+### 4C. index.html — Không cache
+
+```nginx
+location = /index.html {
+    expires -1;
+    add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+    etag on;
+}
+```
+
+**Tại sao không cache index.html:** Xem phần Debug Scenario bên dưới.
+
+---
+
+## 5. Conditional Request (ETag / 304)
+
+`etag on` trong nginx.conf (mặc định đã bật, khai báo rõ để tránh vô tình tắt).
+
+**Cơ chế hoạt động:**
+1. Browser GET `/index.html` → nginx trả về `ETag: "abc123"` kèm nội dung.
+2. Lần sau, browser gửi `If-None-Match: "abc123"`.
+3. Nếu file không đổi → nginx trả `304 Not Modified` (không có body) → tiết kiệm bandwidth.
+
+Không disable ETag để "đơn giản hóa" — đó là bỏ đi một cơ chế tiết kiệm bandwidth quan trọng.
+
+---
+
+## 6. Gzip Compression
+
+```nginx
+gzip on;
+gzip_min_length 1024;   # Không nén file < 1KB (overhead > lợi ích)
+gzip_comp_level 6;      # Cân bằng CPU vs tỉ lệ nén
+gzip_types text/plain text/css application/javascript application/json image/svg+xml ...;
+```
+
+**Không nén:**
+- `image/png`, `image/jpeg`, `image/webp` — đã nén sẵn trong format
+- `font/woff`, `font/woff2` — đã nén sẵn
+- `application/zip`, `application/gzip` — đã nén
+
+**Lý do:** Nén file đã nén → tốn CPU, tăng TTFB, kết quả còn to hơn hoặc bằng.
+
+`gzip_vary on` → thêm `Vary: Accept-Encoding` để CDN/proxy cache đúng cả bản gzip lẫn plain.
+
+---
+
+## 7. Nginx Config Structure
+
+```
+nginx/
+├── nginx.conf          # Global: worker, gzip, open_file_cache, logging
+└── conf.d/
+    └── app.conf        # Server block: cache rules, SPA routing, rate limit
+```
+
+**Không sửa `/etc/nginx/conf.d/default.conf`** — xóa file đó đi, dùng file riêng. Tránh conflict và dễ quản lý.
+
+**Các tuning khác:**
+- `server_tokens off` — ẩn version nginx khỏi response header và error page
+- `autoindex off` — không liệt kê thư mục
+- Chỉ cho phép `GET`, `HEAD`, `OPTIONS` — SPA không cần POST/DELETE
+- Rate limit: `10r/s` cho app routes, `100r/s` cho static assets
+- `open_file_cache max=1000` — cache file descriptor, giảm syscall khi serve static
+
+---
+
+## 8. SPA Routing Edge Cases
+
+```nginx
+location / {
+    try_files $uri $uri/ /index.html;
+}
+
+location ~* \.(js|css|png|...)$ {
+    try_files $uri =404;   # File có extension mà không tồn tại → 404 thật
+}
+```
+
+| Request | Kết quả | Giải thích |
+|---|---|---|
+| `/admin` | `index.html` → React Router xử lý | không phải file → fallback |
+| `/admin/` | `index.html` → React Router xử lý | không phải dir → fallback |
+| `/admin/settings` | `index.html` → React Router xử lý | không phải file → fallback |
+| `/random.txt` | `404` | có extension → block extension → `try_files =404` |
+| `/static/main.abc.js` | file thật | block `/static/` bắt trước bởi `^~` |
+
+**`^~` prefix** trên `/static/` đảm bảo block này được chọn trước bất kỳ regex nào khác.
+
+---
+
+## 9. Debug Scenario
+
+### Vì sao static asset nên immutable?
+
+Vì tên file chứa content hash (`main.3f1a9c.js`). Nếu nội dung thay đổi → hash thay đổi → URL hoàn toàn khác. URL cũ sẽ không bao giờ trỏ đến nội dung khác → cache mãi mãi là an toàn tuyệt đối. `immutable` giúp browser bỏ qua conditional request, giảm round-trip.
+
+### Tại sao không cache index.html?
+
+`index.html` là "bản đồ" của app — nó chứa link đến các file JS/CSS đã hashed. Khi deploy version mới:
+- Các file JS/CSS có URL mới (hash mới) → đã được cache đúng.
+- `index.html` phải trỏ đến URL mới → nếu bị cache, user vẫn nhận `index.html` cũ → load JS/CSS cũ → không thấy version mới.
+
+### Điều gì xảy ra nếu cache index.html 1 năm?
+
+User sẽ không thấy bất kỳ update nào trong 1 năm (hoặc đến khi clear cache). Mọi deploy mới đều vô hiệu với user đó. Đây là lỗi nghiêm trọng nhất trong SPA deployment.
+
+### Khi nào cần `no-store` thay vì `no-cache`?
+
+- `no-cache`: Browser vẫn lưu vào cache, nhưng phải revalidate trước khi dùng (gửi `If-None-Match` → có thể nhận 304).
+- `no-store`: Không lưu gì cả, luôn fetch full response.
+
+Dùng `no-store` khi response chứa dữ liệu nhạy cảm (token, thông tin cá nhân, API response private). Với `index.html` của SPA public, `no-cache` là đủ — nhưng thêm `no-store` để chắc chắn hơn với proxy/CDN trung gian.
+
+### Debug khi user không thấy version mới sau deploy
+
+1. **Kiểm tra `index.html`:** `curl -I https://domain/` → xem `Cache-Control`, `ETag`. Nếu có `max-age` > 0 → đây là nguyên nhân.
+2. **Kiểm tra CDN:** CDN đang cache `index.html`? → Purge cache CDN.
+3. **Kiểm tra browser:** DevTools → Network → disable cache → reload. Nếu thấy version mới → lỗi browser cache.
+4. **Kiểm tra Service Worker:** App có PWA? SW có thể cache `index.html` → cần update SW hoặc unregister.
+5. **Kiểm tra nginx config:** `server_tokens off` che version → xem response header `Server`.
+
+---
+
+## 10. Image Security
+
+| Biện pháp | Cách thực hiện |
+|---|---|
+| Không có Node/npm trong runtime | Multi-stage: stage 3 là `nginx:alpine` |
+| Không có source code | Chỉ `COPY --from=builder /app/build` |
+| Không lộ `.env` | `.dockerignore` exclude `.env*`; dùng build args |
+| Không lộ source map | `GENERATE_SOURCEMAP=false` + `find /app/build -name '*.map' -delete` + nginx block `.map$` → 404 |
+| Không lộ nginx version | `server_tokens off` |
+| Không có `apk` package manager | `apk del apk-tools` trong runtime stage |
+| Non-root | `USER nginx` |
+| No new privileges | `security_opt: no-new-privileges:true` |
+| Read-only filesystem | `read_only: true` + tmpfs cho các thư mục cần write |
+
+**Truyền env vars an toàn:**
+```
+.env (host) → docker-compose args: ${VAR} → Dockerfile ARG → ENV → npm run build (bake vào JS)
+```
+File `.env` không bao giờ vào image. Chỉ giá trị được truyền qua build args.
+
+---
+
+## 11. Stress Simulation — 10k Concurrent Users
+
+### Nginx bottleneck ở đâu?
+
+| Thành phần | Bottleneck |
+|---|---|
+| `worker_processes auto` | = số CPU cores. 1 CPU → 1 worker → giới hạn throughput |
+| `worker_connections 1024` | Tổng connections = `worker_processes × 1024`. 1 worker = 1024 connections max |
+| `open_file_cache max=1000` | Cache 1000 file descriptor. Nếu có nhiều file hơn → cache miss → tăng syscall |
+| Memory | Mỗi connection ~20KB. 10k connections = ~200MB RAM |
+| `client_max_body_size 1m` | Không phải bottleneck cho SPA (không có upload) |
+
+Với `deploy.resources.limits.memory: 128M` hiện tại → không đủ cho 10k concurrent. Cần nâng lên ít nhất 512M.
+
+### Docker limit nên cấu hình gì?
+
+```yaml
+deploy:
+  resources:
+    limits:
+      memory: 512M      # Nâng từ 128M
+      cpus: "2.0"       # Nâng từ 0.5
+    reservations:
+      memory: 128M
+      cpus: "0.5"
+```
+
+### Hướng scale
+
+**Scale vertical (1 server mạnh hơn):**
+- Tăng `worker_connections` lên 4096
+- Tăng `worker_rlimit_nofile` lên 65536
+- Tăng resource limit của container
+
+**Scale horizontal (nhiều container):**
+```
+User → CDN (CloudFlare/CloudFront)
+           ↓ cache miss
+       Load Balancer (nginx upstream / AWS ALB)
+           ↓ round-robin
+    [berry-container-1] [berry-container-2] [berry-container-3]
+```
+
+Vì app là **static files** (không có state, không có session):
+- Mỗi container hoàn toàn độc lập → scale out không cần sticky session
+- CDN cache `index.html` với `s-maxage=0` (không cache) nhưng cache `/static/*` vô thời hạn → giảm tải xuống origin gần như hoàn toàn
+- Thực tế với SPA static: 10k concurrent users → CDN xử lý hầu hết → origin chỉ nhận ~1–5% traffic thật
+
+**Không cần Kubernetes** cho scale đơn giản: Docker Swarm hoặc 3–5 instance sau Load Balancer là đủ cho hầu hết traffic thực tế.
+
+---
+
+## Cấu trúc Files
+
+```
+full-version/
+├── Dockerfile              # 3-stage build
+├── docker-compose.yml      # Container config + build args
+├── .dockerignore           # Exclude node_modules, .env, build tools
+├── nginx/
+│   ├── nginx.conf          # Global nginx config
+│   └── conf.d/
+│       └── app.conf        # Server block, cache rules, SPA routing
+└── .env                    # Env vars (không vào image, đọc bởi docker-compose)
+```

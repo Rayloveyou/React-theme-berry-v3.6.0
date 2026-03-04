@@ -70,14 +70,12 @@ RUN rm /etc/nginx/conf.d/default.conf
 COPY nginx/nginx.conf /etc/nginx/nginx.conf
 COPY nginx/conf.d/ /etc/nginx/conf.d/
 
-# Copy built static files only (no source code)
-COPY --from=builder /app/build /usr/share/nginx/html
+# Copy built static files with correct ownership in a single layer (avoids chown duplicate layer)
+COPY --chown=nginx:nginx --from=builder /app/build /usr/share/nginx/html
 
 # Security hardening & non-root setup
 # nginx:alpine ships with nginx user (uid 101)
 RUN set -eux; \
-    # Set ownership for non-root operation
-    chown -R nginx:nginx /usr/share/nginx/html; \
     chown -R nginx:nginx /var/cache/nginx; \
     chown -R nginx:nginx /var/log/nginx; \
     touch /var/run/nginx.pid; \

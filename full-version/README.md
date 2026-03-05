@@ -67,7 +67,10 @@ Stage 3 — runtime  : COPY /app/build → nginx (không có Node, npm, source c
 ```yaml
 tmpfs:
   - /tmp/nginx:size=10M,uid=101,gid=101
+  - /etc/nginx/conf.d:size=1M,uid=101,gid=101   # bắt buộc nếu dùng dynamic config
 ```
+
+`/etc/nginx/conf.d` cần tmpfs riêng vì `read_only: true` block write — entrypoint cần ghi `app.conf` vào đây lúc startup. Không có tmpfs này → "Read-only file system" error.
 
 ---
 
@@ -91,8 +94,12 @@ location = /health {
 
 ```dockerfile
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q --spider http://localhost:8080/health || exit 1
+    CMD wget -q --spider http://127.0.0.1:8080/health || exit 1
 ```
+
+**Tại sao dùng `127.0.0.1` thay vì `localhost`:**
+
+BusyBox wget (Alpine) resolve `localhost` → `::1` (IPv6 loopback), nhưng nginx `listen 8080;` chỉ bind `0.0.0.0:8080` (IPv4) → "Connection refused". `127.0.0.1` bypass DNS resolution, connect thẳng IPv4.
 
 ---
 
@@ -192,6 +199,7 @@ nginx/
 - `autoindex off` — không liệt kê thư mục
 - Chỉ cho phép `GET`, `HEAD`, `OPTIONS` — SPA không cần POST/DELETE
 - Rate limit: `10r/s` cho app routes, `100r/s` cho static assets
+- `limit_req_status 429` — trả 429 Too Many Requests (default là 503 — sai semantic)
 - `open_file_cache max=1000` — cache file descriptor, giảm syscall khi serve static
 
 ---

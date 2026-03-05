@@ -1,0 +1,104 @@
+# Application Server Block — Berry React Admin Dashboard
+# Values marked ${VARIABLE} are injected at container startup via docker-entrypoint.sh
+# See: nginx/docker-entrypoint.sh for supported env vars and defaults
+
+# ---------- Rate Limiting Zones ----------
+limit_req_zone $binary_remote_addr zone=app_limit:10m    rate=${NGINX_RATE_LIMIT_APP};
+limit_req_zone $binary_remote_addr zone=static_limit:10m rate=${NGINX_RATE_LIMIT_STATIC};
+
+server {
+    listen 8080;
+    server_name ${NGINX_SERVER_NAME};
+
+    root /usr/share/nginx/html;
+    index index.html;
+
+    client_max_body_size ${NGINX_CLIENT_MAX_BODY_SIZE};
+
+    server_tokens off;
+
+    # ---------- Method Restriction ----------
+    if ($request_method !~ ^(GET|HEAD|OPTIONS)$) {
+        return 405;
+    }
+
+    # ---------- Security Headers ----------
+    add_header X-Frame-Options "SAMEORIGIN" always;
+    add_header X-Content-Type-Options "nosniff" always;
+    add_header X-XSS-Protection "1; mode=block" always;
+    add_header Referrer-Policy "strict-origin-when-cross-origin" always;
+    add_header Permissions-Policy "camera=(), microphone=(), geolocation=()" always;
+
+    autoindex off;
+
+    # 1. HEALTH CHECK ENDPOINT
+    location = /health {
+        access_log off;
+        add_header Content-Type text/plain;
+        add_header Cache-Control "no-cache, no-store";
+        return 200 "OK\n";
+    }
+
+    # 2. DENY SOURCE MAPS
+    location ~* \.map$ {
+        return 404;
+    }
+
+    # 3. DENY HIDDEN FILES
+    location ~ /\. {
+        deny all;
+        return 404;
+    }
+
+    # 4A. HASHED STATIC ASSETS — Cache 1 year, immutable
+    location ^~ /static/ {
+        limit_req zone=static_limit burst=${NGINX_RATE_BURST_STATIC} nodelay;
+
+        expires 1y;
+        add_header Cache-Control "public, max-age=31536000, immutable";
+        add_header X-Content-Type-Options "nosniff" always;
+
+        etag off;
+        if_modified_since off;
+
+        access_log off;
+    }
+
+    # 4B. NON-HASHED ASSETS (favicon, manifest, logos)
+    location ~* ^/(favicon\.(ico|svg)|manifest\.json|logo.*\.(png|svg|ico))$ {
+        expires 5m;
+        add_header Cache-Control "public, max-age=300, must-revalidate";
+        add_header X-Content-Type-Options "nosniff" always;
+        etag on;
+    }
+
+    # 4C. INDEX.HTML — Never cache
+    location = /index.html {
+        limit_req zone=app_limit burst=${NGINX_RATE_BURST_APP} nodelay;
+
+        expires -1;
+        add_header Cache-Control "no-cache, no-store, must-revalidate" always;
+        add_header Pragma "no-cache" always;
+
+        etag on;
+    }
+
+    # 5. STATIC FILE REQUESTS (with extensions)
+    location ~* \.(js|css|png|jpg|jpeg|gif|ico|svg|webp|woff|woff2|ttf|eot|otf|txt|xml|json|webmanifest|pdf|zip|gz|mp4|webm|ogg|mp3|wav)$ {
+        try_files $uri =404;
+
+        expires 5m;
+        add_header Cache-Control "public, max-age=300, must-revalidate";
+        add_header X-Content-Type-Options "nosniff" always;
+        etag on;
+
+        access_log off;
+    }
+
+    # 6. SPA ROUTING — All remaining paths
+    location / {
+        limit_req zone=app_limit burst=${NGINX_RATE_BURST_APP} nodelay;
+
+        try_files $uri $uri/ /index.html;
+    }
+}

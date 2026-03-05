@@ -76,9 +76,12 @@ LABEL maintainer="VNCloudOps" \
 # Remove default nginx config
 RUN rm /etc/nginx/conf.d/default.conf
 
-# Copy custom nginx configuration
+# Copy static nginx config and app config template
 COPY nginx/nginx.conf /etc/nginx/nginx.conf
-COPY nginx/conf.d/ /etc/nginx/conf.d/
+COPY nginx/templates/ /etc/nginx/templates/
+
+# Copy custom entrypoint (processes app.conf.template → conf.d/app.conf at startup)
+COPY nginx/docker-entrypoint.sh /docker-entrypoint.sh
 
 # Copy built static files with correct ownership in a single layer (avoids chown duplicate layer)
 COPY --chown=nginx:nginx --from=builder /app/build /usr/share/nginx/html
@@ -86,6 +89,9 @@ COPY --chown=nginx:nginx --from=builder /app/build /usr/share/nginx/html
 # Security hardening & non-root setup
 # nginx:alpine ships with nginx user (uid 101)
 RUN set -eux; \
+    sed -i 's/\r$//' /docker-entrypoint.sh && chmod +x /docker-entrypoint.sh; \
+    # Allow nginx user to write rendered template into conf.d at container startup
+    chown nginx:nginx /etc/nginx/conf.d; \
     chown -R nginx:nginx /var/cache/nginx; \
     chown -R nginx:nginx /var/log/nginx; \
     touch /var/run/nginx.pid; \
@@ -109,6 +115,7 @@ EXPOSE 8080
 
 # Health check — dedicated /health endpoint, NOT index.html
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD wget -q --spider http://localhost:8080/health || exit 1
+    CMD wget -q --spider http://127.0.0.1:8080/health || exit 1
 
+ENTRYPOINT ["/docker-entrypoint.sh"]
 CMD ["nginx", "-g", "daemon off;"]

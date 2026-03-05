@@ -3,6 +3,33 @@
 Tài liệu này giải thích toàn bộ quyết định kỹ thuật khi đóng gói và triển khai ứng dụng React (TypeScript) dưới dạng container production-grade.
 
 ---
+## Quick Start
+
+```bash
+# 1. Cấu hình env (copy rồi điền giá trị)
+cp .env.example .env     # hoặc sửa trực tiếp .env
+
+# 2. Build & Run
+docker compose up -d --build
+
+# 3. Verify
+curl http://localhost:3000/health    # → "OK"
+curl -I http://localhost:3000/       # → 200, no-cache headers
+
+# 4. Logs
+docker compose logs -f berry-app
+
+# Debug — xem nginx config đã được render từ template
+docker compose exec berry-app cat /etc/nginx/conf.d/app.conf
+```
+
+**.env có 2 loại vars:**
+
+| Loại | Prefix | Thời điểm đọc | Khi nào cần `--build` |
+|---|---|---|---|
+| Build-time | `REACT_APP_*` | `npm run build` → bake vào JS bundle | Có — đổi là phải build lại |
+| Runtime | `NGINX_*` | Container start → `envsubst` → nginx config | Không — chỉ cần restart |
+
 
 ## 1. Multi-stage Build & Layer Cache
 
@@ -152,9 +179,10 @@ gzip_types text/plain text/css application/javascript application/json image/svg
 
 ```
 nginx/
-├── nginx.conf          # Global: worker, gzip, open_file_cache, logging
-└── conf.d/
-    └── app.conf        # Server block: cache rules, SPA routing, rate limit
+├── nginx.conf               # Global: worker, gzip, open_file_cache, logging
+├── docker-entrypoint.sh     # Xử lý envsubst trước khi nginx start
+└── templates/
+    └── app.conf.template    # Server block với ${VARIABLE} placeholders (sinh conf.d/app.conf lúc runtime)
 ```
 
 **Không sửa `/etc/nginx/conf.d/default.conf`** — xóa file đó đi, dùng file riêng. Tránh conflict và dễ quản lý.
@@ -239,11 +267,13 @@ Dùng `no-store` khi response chứa dữ liệu nhạy cảm (token, thông tin
 | No new privileges | `security_opt: no-new-privileges:true` |
 | Read-only filesystem | `read_only: true` + tmpfs cho các thư mục cần write |
 
-**Truyền env vars an toàn:**
+**Truyền env vars an toàn — 2 luồng riêng biệt:**
 ```
-.env (host) → docker-compose args: ${VAR} → Dockerfile ARG → ENV → npm run build (bake vào JS)
+.env (host)
+ ├─ REACT_APP_* → docker-compose build.args → Dockerfile ARG/ENV → npm run build → bake vào JS bundle
+ └─ NGINX_*     → docker-compose environment → container runtime → entrypoint.sh → nginx config
 ```
-File `.env` không bao giờ vào image. Chỉ giá trị được truyền qua build args.
+File `.env` không bao giờ vào image. `REACT_APP_*` chỉ truyền giá trị qua build args. `NGINX_*` chỉ tồn tại trong process environment của container.
 
 ---
 
@@ -299,6 +329,105 @@ Vì app là **static files** (không có state, không có session):
 
 ---
 
+## 12. Dynamic Nginx Config via Environment Variables
+
+**Vấn đề:** Nginx config bị hardcode trong image — muốn đổi `server_name`, rate limit, hay body size phải build lại image.
+
+**Giải pháp:** Config được sinh ra lúc container khởi động từ template + env vars, dùng `envsubst`.
+
+### Cách implement
+
+**3 thành phần:**
+
+```
+nginx/templates/app.conf.template  ← template chứa ${VARIABLE} placeholders
+nginx/docker-entrypoint.sh         ← chạy envsubst → ghi /etc/nginx/conf.d/app.conf
+Dockerfile                         ← chown conf.d cho nginx user, override ENTRYPOINT
+```
+
+**Flow khi container start:**
+
+```
+docker run -e NGINX_SERVER_NAME=berry.example.com ...
+     │
+     ▼
+/docker-entrypoint.sh (chạy với USER nginx)
+     │
+     ├─ set defaults: NGINX_SERVER_NAME="${NGINX_SERVER_NAME:-_}"
+     │
+     ├─ envsubst '${NGINX_SERVER_NAME} ${NGINX_RATE_LIMIT_APP} ...'
+     │       < /etc/nginx/templates/app.conf.template
+     │       > /etc/nginx/conf.d/app.conf       ← file được sinh lúc runtime
+     │
+     ├─ nginx -t   ← validate trước khi start
+     │
+     └─ exec "$@"  → nginx -g 'daemon off;'
+```
+
+**Tại sao dùng explicit variable list trong envsubst:**
+
+```sh
+# SAI — envsubst thay hết $... kể cả nginx's own variables
+envsubst < template > output
+
+# ĐÚNG — chỉ thay ${NGINX_*} vars, giữ nguyên $uri, $request_method, $binary_remote_addr...
+envsubst '${NGINX_SERVER_NAME} ${NGINX_RATE_LIMIT_APP}' < template > output
+```
+
+Nginx dùng `$variable` syntax cho internal variables (`$uri`, `$remote_addr`...). Nếu không filter, `envsubst` sẽ replace chúng thành chuỗi rỗng → config bị vỡ.
+
+**Vấn đề non-root:** `USER nginx` trong Dockerfile → entrypoint chạy với quyền nginx, không write được vào `/etc/nginx/conf.d/` (root-owned). Fix trong Dockerfile:
+
+```dockerfile
+RUN chown nginx:nginx /etc/nginx/conf.d;  # nginx user có quyền ghi
+```
+
+### Env vars được hỗ trợ
+
+| Env var | Default | Ý nghĩa |
+|---|---|---|
+| `NGINX_SERVER_NAME` | `_` | Domain / hostname |
+| `NGINX_RATE_LIMIT_APP` | `10r/s` | Rate limit SPA routes |
+| `NGINX_RATE_LIMIT_STATIC` | `100r/s` | Rate limit `/static/` |
+| `NGINX_RATE_BURST_APP` | `20` | Burst size app routes |
+| `NGINX_RATE_BURST_STATIC` | `200` | Burst size static |
+| `NGINX_CLIENT_MAX_BODY_SIZE` | `1m` | Max request body |
+
+### Cách dùng
+
+**Với docker-compose (recommended)** — sửa `.env`, restart container, không cần build lại:
+
+```bash
+# .env
+NGINX_SERVER_NAME=admin.company.com
+NGINX_RATE_LIMIT_APP=20r/s
+NGINX_RATE_BURST_APP=50
+
+# Apply thay đổi (không cần --build)
+docker compose up -d
+
+# Confirm config đã được render đúng
+docker compose exec berry-app cat /etc/nginx/conf.d/app.conf
+```
+
+**Với docker run** (CI/CD pipeline, K8s):
+
+```bash
+docker run \
+  -e NGINX_SERVER_NAME=admin.company.com \
+  -e NGINX_RATE_LIMIT_APP=20r/s \
+  -p 3000:8080 full-version-berry-app:latest
+```
+
+**Kết quả:** Cùng 1 image deploy được dev/staging/production với config khác nhau — không cần build lại image.
+
+### Thêm variable mới
+
+1. Thêm `${NGINX_NEW_VAR}` vào `nginx/templates/app.conf.template`
+2. Thêm default + thêm vào list envsubst trong `nginx/docker-entrypoint.sh`
+
+---
+
 ## Cấu trúc Files
 
 ```
@@ -307,8 +436,9 @@ full-version/
 ├── docker-compose.yml      # Container config + build args
 ├── .dockerignore           # Exclude node_modules, .env, build tools
 ├── nginx/
-│   ├── nginx.conf          # Global nginx config
-│   └── conf.d/
-│       └── app.conf        # Server block, cache rules, SPA routing
+│   ├── nginx.conf              # Global nginx config (static)
+│   ├── docker-entrypoint.sh    # Xử lý envsubst, validate, start nginx
+│   └── templates/
+│       └── app.conf.template   # Server block template (sinh conf.d/app.conf lúc runtime)
 └── .env                    # Env vars (không vào image, đọc bởi docker-compose)
 ```

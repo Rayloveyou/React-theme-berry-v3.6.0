@@ -20,6 +20,15 @@ services:
         REACT_APP_AUTH0_CLIENT_ID: ${REACT_APP_AUTH0_CLIENT_ID}
         REACT_APP_AUTH0_DOMAIN: ${REACT_APP_AUTH0_DOMAIN}
     container_name: berry-react-app
+    # Runtime env vars — passed to docker-entrypoint.sh → envsubst → nginx config
+    # All NGINX_* vars have defaults in nginx/docker-entrypoint.sh (no need to set here unless overriding)
+    environment:
+      NGINX_SERVER_NAME: ${NGINX_SERVER_NAME:-_}
+      NGINX_RATE_LIMIT_APP: ${NGINX_RATE_LIMIT_APP:-10r/s}
+      NGINX_RATE_LIMIT_STATIC: ${NGINX_RATE_LIMIT_STATIC:-100r/s}
+      NGINX_RATE_BURST_APP: ${NGINX_RATE_BURST_APP:-20}
+      NGINX_RATE_BURST_STATIC: ${NGINX_RATE_BURST_STATIC:-200}
+      NGINX_CLIENT_MAX_BODY_SIZE: ${NGINX_CLIENT_MAX_BODY_SIZE:-1m}
     ports:
       - "3000:8080"
     restart: unless-stopped
@@ -28,6 +37,7 @@ services:
       - /tmp/nginx:size=10M,uid=101,gid=101
       - /var/cache/nginx:size=50M,uid=101,gid=101
       - /var/run:size=1M,uid=101,gid=101
+      - /etc/nginx/conf.d:size=1M,uid=101,gid=101   # entrypoint writes rendered app.conf here at startup
     security_opt:
       - no-new-privileges:true
     # Resource limits for production
@@ -40,7 +50,7 @@ services:
           memory: 32M
           cpus: "0.1"
     healthcheck:
-      test: ["CMD", "wget", "-q", "--spider", "http://localhost:8080/health"]
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:8080/health"]
       interval: 30s
       timeout: 3s
       start_period: 5s

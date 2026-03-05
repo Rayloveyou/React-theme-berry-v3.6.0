@@ -1,3 +1,7 @@
+# REACT_APP_* vars are intentionally baked into the JS bundle by CRA (public by design)
+# Suppressing SecretsUsedInArgOrEnv false positives for Firebase/AWS/Auth0 build args
+# check=skip=SecretsUsedInArgOrEnv
+
 # Stage 1: deps — Install dependencies
 FROM node:18-alpine AS deps
 
@@ -53,11 +57,17 @@ ENV GENERATE_SOURCEMAP=false
 ENV NODE_ENV=production
 
 RUN npm run build && \
-    # Remove source maps if any were generated despite env var
-    find /app/build -name '*.map' -delete
+    # Remove source maps
+    find /app/build -name '*.map' -delete && \
+    # Pre-compress text assets at max gzip level (JS compresses ~75%, CSS ~85%, SVG ~80%)
+    find /app/build/static -type f \( -name "*.js" -o -name "*.css" -o -name "*.svg" \) \
+        -exec gzip -9 -k {} \; && \
+    # Delete uncompressed originals — nginx serves .gz via gzip_static always
+    find /app/build/static -type f \( -name "*.js" -o -name "*.css" -o -name "*.svg" \) \
+        ! -name "*.gz" -delete
 
 # Stage 3: runtime — Production nginx (NO Node, npm, source code, build tools)
-FROM nginx:1.27-alpine AS runtime
+FROM nginx:1.27-alpine-slim AS runtime
 
 LABEL maintainer="VNCloudOps" \
       description="Berry React Admin Dashboard - Production Container" \
